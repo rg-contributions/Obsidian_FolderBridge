@@ -45,6 +45,20 @@ type AppInternal = {
 	openWithDefaultApp?(filePath: string): void;
 };
 
+type FileExplorerFolderItem = {
+	setCollapsed?: (collapsed: boolean) => void;
+	collapsed?: boolean;
+	isCollapsed?: boolean;
+	el?: HTMLElement;
+	selfEl?: HTMLElement;
+	containerEl?: HTMLElement;
+	titleEl?: HTMLElement;
+};
+
+type FileExplorerView = {
+	fileItems?: Record<string, FileExplorerFolderItem>;
+};
+
 type DesktopVaultAdapter = DataAdapter & {
 	getBasePath?(): string;
 };
@@ -110,6 +124,18 @@ export default class FolderBridgePlugin extends Plugin {
 	// Preserve original app.openWithDefaultApp so we can restore it on unload
 	private originalOpenWithDefaultApp: unknown = null;
 	statusBarItem: HTMLElement | null = null;
+	explorerObserver: MutationObserver | null = null;
+	private observedExplorerEl: HTMLElement | null = null;
+	private explorerTooltipRoots = new WeakSet<HTMLElement>();
+	private explorerExpansionRoots = new WeakSet<HTMLElement>();
+	private explorerExpansionSaveTimer: number | null = null;
+	private explorerExpansionRevision = 0;
+	private explorerExpansionDirty = false;
+	private nativeTooltipObserver: MutationObserver | null = null;
+	private activeExplorerMountTooltipText: string | null = null;
+	private activeExplorerMountTooltipEl: HTMLElement | null = null;
+	private explorerTimers = new Set<ReturnType<typeof setTimeout>>();
+	private explorerUnloaded = false;
 
 	/** Tracks reachability per mount.id; populated by the 30-second health-check loop. */
 	mountHealthMap = new Map<string, boolean>();
@@ -756,8 +782,30 @@ export default class FolderBridgePlugin extends Plugin {
 		// Add context menu item to ignore files/folders
 		this.registerEvent(
 			this.app.workspace.on('file-menu', (menu, file) => {
-				// Only show if the file is inside a mounted folder
 				const mount = this.pathMapper.getMountForPath(file.path);
+
+				if (file instanceof TFolder && !mount) {
+					menu.addItem((item) => {
+						item
+							.setTitle('Mount external folder here\u2026')
+							.setIcon('folder-plus')
+							.onClick(() => {
+								new MountManagerModal(
+									this.app,
+									this.manifest.name,
+									this.security,
+									async (newMount) => { await this.addExplorerMount(newMount); },
+									undefined,
+									{
+										mountType: 'local',
+										virtualPath: this.getAvailableExplorerMountPath(file.path),
+									},
+								).open();
+							});
+					});
+				}
+
+				// The remaining context actions apply only inside mounted folders.
 				if (!mount) return;
 
 				// "Move mount to…" — only on the mount's own root folder
@@ -858,6 +906,9 @@ export default class FolderBridgePlugin extends Plugin {
 					}
 				}
 
+				// Highlight mounted folders in the file explorer
+				this.setupExplorerHighlighting();
+
 				for (const mount of activeMounts) {
 					await this.notifyVaultMountAdded(mount);
 				}
@@ -886,8 +937,19 @@ export default class FolderBridgePlugin extends Plugin {
 	}
 
 	onunload() {
+		this.explorerUnloaded = true;
+		for (const timer of this.explorerTimers) clearTimeout(timer);
+		this.explorerTimers.clear();
 		this.mountInjections.clear();
 		this.managedTocRevision++;
+		if (this.explorerExpansionSaveTimer !== null) {
+			window.clearTimeout(this.explorerExpansionSaveTimer);
+			this.explorerExpansionSaveTimer = null;
+		}
+		if (this.explorerExpansionDirty) void this.flushExplorerExpansionState();
+		// Stop the file-explorer highlighting observer
+		this.teardownExplorerHighlighting();
+		this.teardownNativeTooltipObserver();
 		// Stop background health-check loop before watcher so no stale notices fire
 		if (this.healthCheckInterval !== null) {
 			clearInterval(this.healthCheckInterval);
@@ -933,6 +995,526 @@ export default class FolderBridgePlugin extends Plugin {
 	// ------------------------------------------------------------------
 	// Helpers
 	// ------------------------------------------------------------------
+
+	/**
+	 * Set up a MutationObserver on the file-explorer DOM to add visual
+	 * indicators (CSS classes) to mounted folders in the tree.
+	 *
+	 * Tooltip: the file explorer renders its file-count tooltip internally, so
+	 * mount details are merged into the already-open tooltip during hover.
+	 */
+	private setupExplorerHighlighting(): void {
+		this.teardownExplorerHighlighting();
+
+		const apply = () => this.highlightMountedInExplorer();
+
+		const tryObserve = () => {
+			const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+			if (!leaves.length) return;
+			const explorerEl = leaves[0].view.containerEl;
+			this.registerExplorerTooltipAugmentation(explorerEl);
+			this.registerExplorerExpansionTracking(explorerEl);
+			this.setupNativeTooltipObserver();
+
+			if (this.observedExplorerEl !== explorerEl) {
+				this.explorerObserver?.disconnect();
+				this.explorerObserver = null;
+				this.observedExplorerEl = explorerEl;
+			}
+			if (this.explorerObserver) {
+				apply();
+				return;
+			}
+
+			this.explorerObserver = new MutationObserver(() => apply());
+			this.explorerObserver.observe(explorerEl, { childList: true, subtree: true });
+			apply();
+		};
+
+		// Initial attempt
+		tryObserve();
+
+		// Re-attach when the file explorer is opened/closed
+		this.registerEvent(this.app.workspace.on('layout-change', () => {
+			// If the observer was lost (file explorer was closed), clean up
+			if (this.explorerObserver) {
+				// Check if the observed element is still in the DOM
+				const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+				const stillAlive = leaves.length > 0 &&
+					document.contains(leaves[0].view.containerEl);
+				if (!stillAlive) {
+					this.explorerObserver.disconnect();
+					this.explorerObserver = null;
+				}
+			}
+			tryObserve();
+		}));
+	}
+
+	private teardownExplorerHighlighting(): void {
+		if (this.explorerObserver) {
+			this.explorerObserver.disconnect();
+			this.explorerObserver = null;
+		}
+		this.observedExplorerEl = null;
+		for (const leaf of this.app.workspace.getLeavesOfType('file-explorer')) {
+			leaf.view.containerEl.querySelectorAll<HTMLElement>('.folderbridge-mounted, .folderbridge-mounted-child').forEach(el => {
+				el.classList.remove('folderbridge-mounted', 'folderbridge-mounted-child');
+				el.removeAttribute('data-folderbridge-mount-type');
+				this.clearExplorerMountMetadata(el);
+			});
+		}
+	}
+
+	private setupNativeTooltipObserver(): void {
+		if (this.nativeTooltipObserver || !document.body) return;
+
+		this.nativeTooltipObserver = new MutationObserver(() => {
+			if (this.activeExplorerMountTooltipText) {
+				this.appendMountInfoToNativeTooltip(this.activeExplorerMountTooltipText);
+			} else {
+				this.removeMountInfoFromNativeTooltips();
+			}
+		});
+		this.nativeTooltipObserver.observe(document.body, { childList: true, subtree: true });
+	}
+
+	private teardownNativeTooltipObserver(): void {
+		if (this.nativeTooltipObserver) {
+			this.nativeTooltipObserver.disconnect();
+			this.nativeTooltipObserver = null;
+		}
+		this.activeExplorerMountTooltipText = null;
+		this.activeExplorerMountTooltipEl = null;
+		this.removeMountInfoFromNativeTooltips();
+	}
+
+	private registerExplorerTooltipAugmentation(explorerEl: HTMLElement): void {
+		if (this.explorerTooltipRoots.has(explorerEl)) return;
+		this.explorerTooltipRoots.add(explorerEl);
+
+		this.registerDomEvent(explorerEl, 'mouseover', (event: MouseEvent) => {
+			const target = event.target;
+			if (!(target instanceof HTMLElement)) return;
+
+			const titleEl = target.closest<HTMLElement>('.nav-folder-title, .nav-file-title');
+			if (!titleEl || !explorerEl.contains(titleEl)) return;
+
+			const folderTitleEl = titleEl.matches('.nav-folder-title.folderbridge-mounted')
+				? titleEl
+				: null;
+			if (!folderTitleEl) {
+				this.activeExplorerMountTooltipText = null;
+				this.activeExplorerMountTooltipEl = null;
+				this.removeMountInfoFromNativeTooltips();
+				return;
+			}
+
+			this.scheduleNativeTooltipAugmentation(folderTitleEl);
+		}, true);
+
+		this.registerDomEvent(explorerEl, 'mouseout', (event: MouseEvent) => {
+			const target = event.target;
+			if (!(target instanceof HTMLElement)) return;
+
+			const folderTitleEl = target.closest<HTMLElement>('.nav-folder-title.folderbridge-mounted');
+			if (!folderTitleEl || !explorerEl.contains(folderTitleEl)) return;
+
+			const relatedTarget = event.relatedTarget;
+			if (relatedTarget instanceof Node && folderTitleEl.contains(relatedTarget)) return;
+
+			this.activeExplorerMountTooltipText = null;
+			this.activeExplorerMountTooltipEl = null;
+			this.removeMountInfoFromNativeTooltips();
+		}, true);
+	}
+
+	private registerExplorerExpansionTracking(explorerEl: HTMLElement): void {
+		if (this.explorerExpansionRoots.has(explorerEl)) return;
+		this.explorerExpansionRoots.add(explorerEl);
+
+		const scheduleFromEvent = (event: Event) => {
+			const target = event.target;
+			if (!(target instanceof HTMLElement)) return;
+
+			const titleEl = target.closest<HTMLElement>('.nav-folder-title');
+			if (!titleEl || !explorerEl.contains(titleEl)) return;
+
+			const dataPath = titleEl.getAttribute('data-path');
+			if (!dataPath || !this.isFolderBridgeExplorerPath(dataPath)) return;
+
+			this.scheduleExplorerExpansionStateCapture(explorerEl);
+		};
+
+		this.registerDomEvent(explorerEl, 'click', scheduleFromEvent, true);
+		this.registerDomEvent(explorerEl, 'keydown', (event: KeyboardEvent) => {
+			if (!['Enter', ' ', 'ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+			scheduleFromEvent(event);
+		}, true);
+	}
+
+	private getFileExplorerView(): FileExplorerView | null {
+		const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+		if (!leaves.length) return null;
+		return leaves[0].view as unknown as FileExplorerView;
+	}
+
+	private isFolderBridgeExplorerPath(pathValue: string): boolean {
+		const normalized = normalizePath(pathValue);
+		if (!normalized) return false;
+
+		const activeMountPaths = this.settings.mountPoints
+			.filter(m => m.enabled && this.isMountEnabledOnThisDevice(m))
+			.map(m => normalizePath(m.virtualPath));
+
+		return activeMountPaths.some(mountPath =>
+			normalized === mountPath ||
+			normalized.startsWith(mountPath + '/') ||
+			mountPath.startsWith(normalized + '/')
+		);
+	}
+
+	private scheduleExplorerExpansionStateCapture(explorerEl: HTMLElement): void {
+		this.scheduleExplorerWork(() => this.captureExplorerExpansionState(explorerEl), 75);
+		this.scheduleExplorerWork(() => this.captureExplorerExpansionState(explorerEl), 250);
+	}
+
+	private scheduleExplorerWork(callback: () => void, delay: number): void {
+		if (this.explorerUnloaded) return;
+		const timer = setTimeout(() => {
+			this.explorerTimers.delete(timer);
+			if (!this.explorerUnloaded) callback();
+		}, delay);
+		this.explorerTimers.add(timer);
+	}
+
+	private getAvailableExplorerMountPath(parent: string): string {
+		const base = normalizePath(`${parent}/External`);
+		let candidate = base;
+		let suffix = 2;
+		while (this.app.vault.getAbstractFileByPath(candidate) || this.pathMapper.getMountForPath(candidate)) {
+			candidate = `${base} ${suffix++}`;
+		}
+		return candidate;
+	}
+
+	private async addExplorerMount(mount: Omit<MountPoint, 'id'>): Promise<void> {
+		if (this.app.vault.getAbstractFileByPath(normalizePath(mount.virtualPath))) {
+			throw new Error('Choose a new virtual folder; the selected path already exists in the vault.');
+		}
+		await this.addMount(mount);
+	}
+
+	private captureExplorerExpansionState(explorerEl: HTMLElement): void {
+		let changed = false;
+		const nextState = {
+			...(this.settings.explorerExpansionState ?? {}),
+		};
+
+		explorerEl.querySelectorAll<HTMLElement>('.nav-folder-title[data-path]').forEach(titleEl => {
+			const dataPath = titleEl.getAttribute('data-path');
+			if (!dataPath || !this.isFolderBridgeExplorerPath(dataPath)) return;
+
+			const normalized = normalizePath(dataPath);
+			const expanded = this.readExplorerFolderExpanded(normalized, titleEl);
+			if (expanded === null) return;
+
+			if (nextState[normalized] !== expanded) {
+				nextState[normalized] = expanded;
+				changed = true;
+			}
+		});
+
+		if (!changed) return;
+		this.settings.explorerExpansionState = nextState;
+		this.queueExplorerExpansionStateSave();
+	}
+
+	private queueExplorerExpansionStateSave(): void {
+		this.explorerExpansionDirty = true;
+		this.explorerExpansionRevision++;
+		if (this.explorerExpansionSaveTimer !== null) {
+			window.clearTimeout(this.explorerExpansionSaveTimer);
+		}
+		this.explorerExpansionSaveTimer = window.setTimeout(() => {
+			this.explorerExpansionSaveTimer = null;
+			void this.flushExplorerExpansionState();
+		}, 500);
+	}
+
+	private async flushExplorerExpansionState(): Promise<void> {
+		const revision = this.explorerExpansionRevision;
+		try {
+			await this.saveSettings();
+			if (revision === this.explorerExpansionRevision) this.explorerExpansionDirty = false;
+		} catch (error) {
+			logger.error('Folder Bridge: could not save explorer expansion state', error);
+			new Notice('Folder Bridge: could not save folder expansion state. It will be retried on the next change or unload.');
+		}
+	}
+
+	private readExplorerFolderExpanded(pathValue: string, titleEl?: HTMLElement): boolean | null {
+		const item = this.getFileExplorerView()?.fileItems?.[normalizePath(pathValue)];
+		if (typeof item?.collapsed === 'boolean') return !item.collapsed;
+		if (typeof item?.isCollapsed === 'boolean') return !item.isCollapsed;
+
+		const itemRoot = item?.selfEl ?? item?.containerEl ?? item?.el ?? item?.titleEl;
+		const folderEl = titleEl?.closest<HTMLElement>('.nav-folder') ?? itemRoot?.closest<HTMLElement>('.nav-folder');
+		if (!folderEl) return null;
+
+		if (folderEl.classList.contains('is-collapsed')) return false;
+		if (folderEl.classList.contains('is-expanded')) return true;
+
+		const childContainer = folderEl.querySelector<HTMLElement>(':scope > .nav-folder-children');
+		if (!childContainer) return null;
+		return window.getComputedStyle(childContainer).display !== 'none';
+	}
+
+	private applySavedExplorerExpansionState(mount: MountPoint): void {
+		const savedState = this.settings.explorerExpansionState ?? {};
+		const savedPaths = Object.keys(savedState);
+		if (savedPaths.length === 0) return;
+
+		const mountPath = normalizePath(mount.virtualPath);
+		const fileItems = this.getFileExplorerView()?.fileItems;
+		if (!fileItems) return;
+
+		for (const savedPath of savedPaths) {
+			const normalized = normalizePath(savedPath);
+			if (
+				normalized !== mountPath &&
+				!normalized.startsWith(mountPath + '/') &&
+				!mountPath.startsWith(normalized + '/')
+			) {
+				continue;
+			}
+
+			const folderItem = fileItems[normalized];
+			if (typeof folderItem?.setCollapsed === 'function') {
+				folderItem.setCollapsed(!savedState[savedPath]);
+			}
+		}
+	}
+
+	private scheduleNativeTooltipAugmentation(folderTitleEl: HTMLElement): void {
+		const tooltipText = folderTitleEl.dataset.folderbridgeMountTooltip;
+		if (!tooltipText) return;
+		this.activeExplorerMountTooltipText = tooltipText;
+		this.activeExplorerMountTooltipEl = folderTitleEl;
+
+		const apply = () => this.appendMountInfoToNativeTooltip(tooltipText);
+		for (const delay of [0, 50, 150, 300, 600]) this.scheduleExplorerWork(apply, delay);
+	}
+
+	private appendMountInfoToNativeTooltip(tooltipText: string): void {
+		if (this.explorerUnloaded || this.activeExplorerMountTooltipText !== tooltipText ||
+			!this.activeExplorerMountTooltipEl?.isConnected || !this.activeExplorerMountTooltipEl.matches(':hover')) return;
+		const tooltipEl = Array.from(document.querySelectorAll<HTMLElement>('.tooltip, [class~="tooltip"]'))
+			.reverse()
+			.find(el => {
+				const rect = el.getBoundingClientRect();
+				return rect.width > 0 && rect.height > 0;
+			});
+		if (!tooltipEl) return;
+
+		const contentEl = this.findNativeTooltipContentEl(tooltipEl);
+		const existingAugmented = tooltipEl.querySelector<HTMLElement>('.folderbridge-tooltip-augmented');
+		if (existingAugmented?.dataset.folderbridgeText === tooltipText) return;
+
+		const originalText = this.stripExplorerMountTooltipText(
+			existingAugmented?.dataset.folderbridgeOriginalText ?? contentEl.textContent?.trim() ?? ''
+		);
+		tooltipEl.addClass('folderbridge-tooltip-container-augmented');
+		const tooltipStyle = window.getComputedStyle(tooltipEl);
+		const tooltipBackgroundColor = this.getVisibleBackgroundColor(tooltipEl);
+		if (tooltipBackgroundColor) {
+			tooltipEl.style.backgroundColor = tooltipBackgroundColor;
+		}
+		tooltipEl.style.color = tooltipStyle.color;
+
+		contentEl.querySelectorAll<HTMLElement>('.folderbridge-tooltip-augmented').forEach(el => el.remove());
+		Array.from(contentEl.childNodes).forEach(node => {
+			if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) {
+				node.remove();
+			}
+		});
+
+		const augmentedEl = document.createElement('div');
+		augmentedEl.className = 'folderbridge-tooltip-augmented';
+		augmentedEl.dataset.folderbridgeOriginalText = originalText;
+		augmentedEl.dataset.folderbridgeText = tooltipText;
+
+		for (const line of [originalText, ...tooltipText.split('\n')].filter(Boolean)) {
+			const lineEl = document.createElement('div');
+			lineEl.className = 'folderbridge-tooltip-line';
+			lineEl.textContent = line;
+			augmentedEl.appendChild(lineEl);
+		}
+		contentEl.appendChild(augmentedEl);
+	}
+
+	private findNativeTooltipContentEl(tooltipEl: HTMLElement): HTMLElement {
+		const existingAugmented = tooltipEl.querySelector<HTMLElement>('.folderbridge-tooltip-augmented');
+		if (existingAugmented?.parentElement instanceof HTMLElement) return existingAugmented.parentElement;
+
+		const candidates = [
+			...Array.from(tooltipEl.querySelectorAll<HTMLElement>('*')),
+			tooltipEl,
+		];
+
+		const visibleTextCandidates = candidates.filter(el => {
+			if (el.classList.contains('folderbridge-tooltip-augmented')) return true;
+			if (el.className.toString().includes('arrow')) return false;
+			const rect = el.getBoundingClientRect();
+			return rect.width > 0 && rect.height > 0 && !!el.textContent?.trim();
+		});
+
+		const leafTextEl = visibleTextCandidates.find(el =>
+			!Array.from(el.children).some(child => child.textContent?.trim() === el.textContent?.trim())
+		);
+		if (leafTextEl) return leafTextEl;
+
+		return tooltipEl.querySelector<HTMLElement>('.tooltip-content') ?? tooltipEl;
+	}
+
+	private stripExplorerMountTooltipText(text: string): string {
+		const markerIndices = ['Mount:', 'Path:']
+			.map(marker => text.indexOf(marker))
+			.filter(index => index >= 0);
+		const firstMarkerIndex = markerIndices.length > 0 ? Math.min(...markerIndices) : -1;
+		const baseText = firstMarkerIndex >= 0 ? text.slice(0, firstMarkerIndex) : text;
+		return baseText
+			.split('\n')
+			.map(line => line.trim())
+			.filter(line => line && !line.startsWith('Mount:') && !line.startsWith('Path:'))
+			.join(' ');
+	}
+
+	private getVisibleBackgroundColor(el: HTMLElement): string | null {
+		const candidates = [
+			el,
+			...Array.from(el.querySelectorAll<HTMLElement>('*')),
+		];
+
+		for (const candidate of candidates) {
+			const backgroundColor = window.getComputedStyle(candidate).backgroundColor;
+			if (
+				backgroundColor &&
+				backgroundColor !== 'transparent' &&
+				!backgroundColor.endsWith(', 0)') &&
+				backgroundColor !== 'rgba(0, 0, 0, 0)'
+			) {
+				return backgroundColor;
+			}
+		}
+
+		return null;
+	}
+
+	private removeMountInfoFromNativeTooltips(): void {
+		document.querySelectorAll<HTMLElement>('.folderbridge-tooltip-container-augmented').forEach(el => {
+			el.removeClass('folderbridge-tooltip-container-augmented');
+			el.style.removeProperty('background-color');
+			el.style.removeProperty('color');
+		});
+		document.querySelectorAll<HTMLElement>('.folderbridge-tooltip-augmented').forEach(el => {
+			const originalText = el.dataset.folderbridgeOriginalText;
+			if (originalText !== undefined) {
+				el.replaceWith(document.createTextNode(originalText));
+			} else {
+				el.remove();
+			}
+		});
+	}
+
+	private setExplorerMountMetadata(el: HTMLElement, mount: MountPoint, typeLabel: string): void {
+		const label = mount.label ? ` (${mount.label})` : '';
+		const source = !mount.mountType || mount.mountType === 'local' || mount.mountType === 'vault'
+			? this.pathMapper.getEffectiveRealPath(mount) : mount.realPath;
+		el.dataset.folderbridgeMountTooltip = [
+			`Mount: ${typeLabel}${label}`,
+			`Path: ${source}`,
+		].join('\n');
+	}
+
+	private clearExplorerMountMetadata(el: HTMLElement): void {
+		delete el.dataset.folderbridgeMountTooltip;
+	}
+
+	/**
+	 * Walk the file-explorer DOM and add CSS classes to tree items whose
+	 * path belongs to a mount point.  Also sets a tooltip with mount source
+	 * details on the root folder of each mount.
+	 */
+	private highlightMountedInExplorer(): void {
+		const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+		if (!leaves.length) return;
+
+		const explorerEl = leaves[0].view.containerEl;
+
+		// Collect mount paths for fast lookup
+		const activeMounts = this.settings.mountPoints.filter(m => m.enabled && this.isMountEnabledOnThisDevice(m));
+		const mountPaths = new Set(activeMounts.map(m => normalizePath(m.virtualPath)));
+		// Map: path -> MountPoint for tooltip and type-specific styling
+		const mountMap = new Map<string, MountPoint>();
+		for (const m of activeMounts) {
+			mountMap.set(normalizePath(m.virtualPath), m);
+		}
+
+		const mountTypeLabel: Record<string, string> = {
+			local: 'Local folder',
+			vault: 'External vault',
+			webdav: 'WebDAV',
+			s3: 'S3',
+			sftp: 'SFTP',
+		};
+
+		// Process folder items
+		explorerEl.querySelectorAll<HTMLElement>('.nav-folder-title').forEach(el => {
+			const dataPath = el.getAttribute('data-path');
+			if (!dataPath) return;
+			const normalized = normalizePath(dataPath);
+
+			if (mountPaths.has(normalized)) {
+				// This is the mount root folder
+				el.classList.add('folderbridge-mounted');
+				const mount = mountMap.get(normalized);
+				const mountType = mount?.mountType ?? 'local';
+				el.setAttribute('data-folderbridge-mount-type', mountType);
+
+				if (mount) {
+					const typeLabel = mountTypeLabel[mountType] ?? mountType;
+					this.setExplorerMountMetadata(el, mount, typeLabel);
+				}
+			} else {
+				el.classList.remove('folderbridge-mounted');
+				el.removeAttribute('data-folderbridge-mount-type');
+				this.clearExplorerMountMetadata(el);
+			}
+
+			// Check if this folder is a child of a mounted folder
+			const isChild = [...mountPaths].some(mp => normalized.startsWith(mp + '/'));
+			if (isChild) {
+				el.classList.add('folderbridge-mounted-child');
+			} else {
+				el.classList.remove('folderbridge-mounted-child');
+			}
+		});
+
+		// Also mark files inside mounted folders
+		explorerEl.querySelectorAll<HTMLElement>('.nav-file-title').forEach(el => {
+			const dataPath = el.getAttribute('data-path');
+			if (!dataPath) return;
+			const normalized = normalizePath(dataPath);
+
+			const isInMount = [...mountPaths].some(mp => normalized.startsWith(mp + '/'));
+			if (isInMount) {
+				el.classList.add('folderbridge-mounted-child');
+			} else {
+				el.classList.remove('folderbridge-mounted-child');
+			}
+		});
+	}
 
 	private ignoreCache = new Map<string, { nameStrings: string[], pathStrings: string[], regexes: RegExp[] }>();
 
@@ -1872,27 +2454,21 @@ export default class FolderBridgePlugin extends Plugin {
 			}
 		}
 
-		// Force the file explorer to refresh the folder contents by expanding and collapsing it
+		// Restore Folder Bridge's own expansion cache after virtual folders have
+		// been injected. Obsidian restores native folder state before these paths
+		// exist, so mount folders need this late pass.
 		if (!suppressionEnabled) setTimeout(() => {
 			if (!isCurrent()) return;
-			const fileExplorerLeaves = this.app.workspace.getLeavesOfType('file-explorer');
-			if (fileExplorerLeaves.length === 0) return;
-
-			type FileExplorerView = { fileItems?: Record<string, { setCollapsed?: (collapsed: boolean) => void }> };
-			const fileExplorerView = fileExplorerLeaves[0].view as unknown as FileExplorerView;
-			const fileItems = fileExplorerView.fileItems;
-
-			const folderPath = normalizePath(mount.virtualPath);
-			if (fileItems && fileItems[folderPath]) {
-				const folderItem = fileItems[folderPath];
-				if (typeof folderItem.setCollapsed === 'function') {
-					folderItem.setCollapsed(false);
-				}
-			}
+			this.applySavedExplorerExpansionState(mount);
 		}, 100);
 
 		// [FEATURE_20260222] Start watching the mount for external changes
 		if (isCurrent()) this.fileWatcher?.startWatching(mount);
+
+		// Refresh file-explorer highlights after mount injection
+		this.scheduleExplorerWork(() => {
+			if (isCurrent()) this.highlightMountedInExplorer();
+		}, 200);
 	}
 
 	/**
@@ -1945,6 +2521,9 @@ export default class FolderBridgePlugin extends Plugin {
 		} catch (e) {
 			logger.debug('Folder Bridge: vault.onChange(folder-removed) unavailable', e);
 		}
+
+		// Refresh file-explorer highlights after mount removal
+		this.scheduleExplorerWork(() => this.highlightMountedInExplorer(), 200);
 	}
 
 	// ------------------------------------------------------------------
@@ -2166,6 +2745,9 @@ export default class FolderBridgePlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
 		this.settings.managedTocSource = this.settings.managedTocSource ?? '';
 		this.settings.managedTocSourceFallback = this.settings.managedTocSourceFallback ?? '';
+		this.settings.explorerExpansionState = {
+			...(this.settings.explorerExpansionState ?? {}),
+		};
 		this.persistedMountPoints = [...this.settings.mountPoints];
 		this.persistedAllowlist = [...this.settings.allowlist];
 
