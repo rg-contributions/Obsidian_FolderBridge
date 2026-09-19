@@ -101,6 +101,153 @@ describe('main fallback regressions', () => {
         vi.restoreAllMocks();
     });
 
+    it('suggests an unused child and refuses to shadow existing vault folders', async () => {
+        const { plugin, files } = await makePlugin();
+        const explorer = plugin as unknown as {
+            getAvailableExplorerMountPath(parent: string): string;
+            addExplorerMount(value: Omit<MountPoint, 'id'>): Promise<void>;
+        };
+        files.set('Projects', new TFolder());
+        files.set('Projects/External', new TFolder());
+        expect(explorer.getAvailableExplorerMountPath('Projects')).toBe('Projects/External 2');
+        const add = vi.spyOn(plugin, 'addMount').mockResolvedValue(undefined);
+        await expect(explorer.addExplorerMount({ ...mount('docs'), virtualPath: 'Projects' })).rejects.toThrow('already exists');
+        expect(add).not.toHaveBeenCalled();
+        await explorer.addExplorerMount({ ...mount('docs'), virtualPath: 'Projects/External 2' });
+        expect(add).toHaveBeenCalledOnce();
+    });
+
+    it('reattaches observation when a layout replaces the explorer container', async () => {
+        const { plugin, app } = await makePlugin();
+        const container = () => ({ querySelectorAll: () => [] }) as unknown as HTMLElement;
+        let current = container();
+        let layoutChanged!: () => void;
+        const observers: Array<{ observe: ReturnType<typeof vi.fn>; disconnect: ReturnType<typeof vi.fn> }> = [];
+        const explorer = plugin as unknown as {
+            setupExplorerHighlighting(): void;
+            registerExplorerTooltipAugmentation(): void;
+            registerExplorerExpansionTracking(): void;
+            setupNativeTooltipObserver(): void;
+            highlightMountedInExplorer(): void;
+        };
+        for (const method of ['registerExplorerTooltipAugmentation', 'registerExplorerExpansionTracking', 'setupNativeTooltipObserver', 'highlightMountedInExplorer'] as const) {
+            vi.spyOn(explorer, method).mockImplementation(() => {});
+        }
+        Object.assign(app.workspace, {
+            getLeavesOfType: () => [{ view: { containerEl: current } }],
+            on: (_event: string, callback: () => void) => { layoutChanged = callback; },
+        });
+        Object.assign(plugin, { registerEvent: vi.fn() });
+        vi.stubGlobal('document', { contains: () => true });
+        vi.stubGlobal('MutationObserver', class {
+            observe = vi.fn();
+            disconnect = vi.fn();
+            constructor() { observers.push(this); }
+        });
+        try {
+            explorer.setupExplorerHighlighting();
+            expect(observers[0].observe).toHaveBeenCalledWith(current, { childList: true, subtree: true });
+            current = container();
+            layoutChanged();
+            expect(observers[0].disconnect).toHaveBeenCalledOnce();
+            expect(observers[1].observe).toHaveBeenCalledWith(current, { childList: true, subtree: true });
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('handles expansion persistence failures and keeps dirty state until retry succeeds', async () => {
+        const { plugin } = await makePlugin();
+        const explorer = plugin as unknown as {
+            explorerExpansionDirty: boolean;
+            flushExplorerExpansionState(): Promise<void>;
+        };
+        explorer.explorerExpansionDirty = true;
+        const save = vi.spyOn(plugin, 'saveSettings').mockRejectedValueOnce(new Error('disk unavailable')).mockResolvedValue(undefined);
+        await expect(explorer.flushExplorerExpansionState()).resolves.toBeUndefined();
+        expect(explorer.explorerExpansionDirty).toBe(true);
+        await explorer.flushExplorerExpansionState();
+        expect(explorer.explorerExpansionDirty).toBe(false);
+        expect(save).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+        { deviceOverrides: { desktop: '/override' } },
+        { fallbackRealPath: '/fallback' },
+    ])('tracks expansion for a foreign mount enabled by %j', async configuration => {
+        const existing = { ...mount('docs'), deviceId: 'other', ...configuration };
+        const { plugin } = await makePlugin([existing]);
+        const explorer = plugin as unknown as { isFolderBridgeExplorerPath(path: string): boolean };
+        expect(explorer.isFolderBridgeExplorerPath('docs/nested')).toBe(true);
+        expect(explorer.isFolderBridgeExplorerPath('docs-sibling')).toBe(false);
+        plugin.settings.mountPoints[0].enabled = false;
+        expect(explorer.isFolderBridgeExplorerPath('docs')).toBe(false);
+    });
+
+    it('uses the effective source and preserves native attributes when clearing metadata', async () => {
+        const existing = mount('docs');
+        const { plugin } = await makePlugin([existing]);
+        plugin.pathMapper.setResolvedPath(existing.id, '/fallback');
+        const explorer = plugin as unknown as {
+            setExplorerMountMetadata(el: HTMLElement, value: MountPoint, label: string): void;
+            clearExplorerMountMetadata(el: HTMLElement): void;
+        };
+        const element = { dataset: {}, removeAttribute: vi.fn(), querySelectorAll: vi.fn() } as unknown as HTMLElement;
+        explorer.setExplorerMountMetadata(element, existing, 'Local folder');
+        expect(element.dataset.folderbridgeMountTooltip).toContain('Path: /fallback');
+        explorer.clearExplorerMountMetadata(element);
+        expect(element.dataset.folderbridgeMountTooltip).toBeUndefined();
+        expect(element.removeAttribute).not.toHaveBeenCalled();
+        expect(element.querySelectorAll).not.toHaveBeenCalled();
+    });
+
+    it('ignores queued tooltip updates after the hovered mount loses ownership', async () => {
+        const { plugin } = await makePlugin();
+        const explorer = plugin as unknown as {
+            activeExplorerMountTooltipText: string | null;
+            activeExplorerMountTooltipEl: HTMLElement | null;
+            appendMountInfoToNativeTooltip(text: string): void;
+        };
+        const query = vi.fn().mockReturnValue([]);
+        vi.stubGlobal('document', { querySelectorAll: query });
+        try {
+            explorer.activeExplorerMountTooltipText = null;
+            explorer.appendMountInfoToNativeTooltip('old mount');
+            explorer.activeExplorerMountTooltipText = 'old mount';
+            explorer.activeExplorerMountTooltipEl = { isConnected: true, matches: () => false } as unknown as HTMLElement;
+            explorer.appendMountInfoToNativeTooltip('old mount');
+            expect(query).not.toHaveBeenCalled();
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('cancels queued explorer work on unload and does not schedule more work', async () => {
+        const { plugin } = await makePlugin();
+        vi.useFakeTimers();
+        vi.stubGlobal('document', { querySelectorAll: () => [] });
+        const explorer = plugin as unknown as {
+            scheduleExplorerWork(callback: () => void, delay: number): void;
+            scheduleExplorerExpansionStateCapture(element: HTMLElement): void;
+            captureExplorerExpansionState(element: HTMLElement): void;
+        };
+        Object.assign(plugin, { fileServer: { stop: vi.fn() } });
+        const callback = vi.fn();
+        const capture = vi.spyOn(explorer, 'captureExplorerExpansionState');
+        try {
+            explorer.scheduleExplorerWork(callback, 10);
+            explorer.scheduleExplorerExpansionStateCapture({} as HTMLElement);
+            plugin.onunload();
+            explorer.scheduleExplorerWork(callback, 10);
+            vi.runAllTimers();
+            expect(callback).not.toHaveBeenCalled();
+            expect(capture).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+            vi.unstubAllGlobals();
+        }
+    });
+
     it('loads the selected fallback before adding so destination mounts survive', async () => {
         vi.mocked(fs.readFile).mockImplementation(source => Promise.resolve(serializeTocConfig([
             mount(source === '/old.json' ? 'old' : 'destination'),

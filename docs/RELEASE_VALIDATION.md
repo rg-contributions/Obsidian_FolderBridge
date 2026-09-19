@@ -1,7 +1,13 @@
 # Compatibility Release Validation
 
-This checklist tracks the unreleased compatibility work following 2.15.2. Local
-source reconciliation does not merge PRs, publish a release, or close issues.
+This checklist tracks compatibility and explorer integration following 2.15.2.
+The compatibility batch shipped as opt-in prerelease 2.15.3-rc.1 through PRs
+#42 and #43. The remaining integration adds PR #39 and records the ancestry of
+the older PRs whose changes were already included in #42.
+
+On 2026-09-19 the maintainer chose to merge and test, then wait for native results.
+Do not bump the version or publish a stable release until that gate is satisfied.
+The existing prerelease does not contain the subsequent explorer integration.
 
 ## Automated Checks
 
@@ -36,6 +42,8 @@ All native checks below remain pending. Existing CI runs on Ubuntu only.
 | Settings / #35, #41 | Reopen an edited mount with auto-label enabled; edit virtual path at narrow and desktop widths. Repeat on current and oldest supported hosts. | Checkbox state persists; input remains visible and editable; no missing API exception. |
 | Footnotes / #34 | Open a mounted note with footnotes in reading view; edit, switch views, reopen, and restart. | Footnotes render and cached content refreshes correctly. |
 | Android / #18 | Install the packaged candidate on Android and enable it; configure a supported remote mount. Repeat after restarting the app. | No Node/Electron module-load failure; remote note opens; desktop-only local access is not required. |
+| Explorer / #39 | Add a mount using a native folder's context menu; hover mounted and ordinary rows; collapse and reopen folders; close/reopen the explorer and disable the plugin. | Mount uses a new child destination without shadowing native files; details show the active source; unrelated tooltips are unchanged; expansion persists; decorations and callbacks stop on unload. |
+| macOS watcher / #39 | Enable a local mount and create/edit a disposable source file externally. | Watcher starts without native fsevents binding errors and updates the mounted tree. |
 
 Unit tests also cover mounted binary append and rejection for unsupported remote
 mounts. Verify binary integrity against disposable files when testing a plugin
@@ -43,21 +51,28 @@ workflow that uses `appendBinary`.
 
 ## PR And Distribution Gates
 
-- PR #40's path, fallback, credential, and settings compatibility changes are
-  represented locally. Remove uses a guarded destructive API; Reconnect is not
-  styled as destructive. PR #28's portability and typing changes are represented
-  locally. Their GitHub merge conflicts are not resolved by this working-tree work.
-- The Windows optional-module importer fix associated with #27 is included and
-  regression-tested. Review overlapping PRs #27, #30, and #31 against the final
-  candidate before merging or closing them.
+- PRs #27, #28, #30, #31, and #40 were audited against main at 46a53d2. All
+  behavioral changes are represented by #42 and follow-up regression fixes.
+  Their ancestry is integrated without reapplying the older implementations or
+  #40's obsolete version metadata. Remove retains its guarded destructive API;
+  Reconnect remains neutral.
+- PR #39's explorer metadata, context action, expansion persistence, and fsevents
+  workaround are integrated with additional destination and lifecycle guards.
+  Automated tests cover native-path rejection, effective-source metadata,
+  device overrides, stale tooltips, unload, observer replacement, and save errors.
 - Reconcile branches only after preserving and reviewing the existing uncommitted
   work. Do not sweep unrelated files into a release commit.
 - Record native results before a version bump or release. After publishing,
   confirm BRAT/manual installation uses the tested assets.
-- The last registry check found no `folderbridge` entry in the official Community
-  Plugins registry. The legacy submission link was inaccessible, so its status
-  is unverified. Locate or establish the current submission and address its
-  checks before resolving #25/#38 or advertising directory installation.
+- The community website has a FolderBridge entry, now claimed by the maintainer.
+  The directory reports no matching release despite the exact prerelease tag and
+  assets existing on GitHub. Prerelease filtering versus stale directory data is
+  not established. Use the authenticated branch preview and release recheck;
+  do not claim directory approval or in-app availability from the listing alone.
+- Legacy submission #10426 had a passing entry-validation run, not verified full
+  approval. Current review concerns include suppressed unsafe-return lint errors,
+  donation-link placement, and minimum-host/mobile declarations. Track these
+  separately from the functional integration and native test results.
 
 ## Deferred Work
 
