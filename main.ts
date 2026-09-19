@@ -1249,7 +1249,7 @@ export default class FolderBridgePlugin extends Plugin {
 			if (revision === this.explorerExpansionRevision) this.explorerExpansionDirty = false;
 		} catch (error) {
 			logger.error('Folder Bridge: could not save explorer expansion state', error);
-			new Notice('Folder Bridge: could not save folder expansion state. It will be retried on the next change or unload.');
+			new Notice('Could not save folder expansion state; retrying on the next change or unload.');
 		}
 	}
 
