@@ -338,14 +338,25 @@ export class FileWatcher {
                 // Obsidian expects a stat object for created/modified files
                 const stat = await this.app.vault.adapter.stat(normalizedPath);
                 if (stat && isCurrent()) {
-                    await vault.onChange(eventType, normalizedPath, null, stat);
+                    // Obsidian's internal Vault.onChange only understands a fixed set of
+                    // event names. 'file-changed' (chokidar's name) matches none of them,
+                    // so the notification is silently dropped — the TFile stat/content cache
+                    // is never invalidated, MetadataCache never re-parses headings, and the
+                    // open editor keeps a stale buffer that overwrites external edits on save.
+                    // Obsidian's name for an external file modification is 'modified': it
+                    // updates the file's stat, clears its content cache, and triggers the
+                    // vault 'modify' event that recomputes metadata and reloads open views.
+                    const obsidianEvent = eventType === 'file-changed' ? 'modified' : eventType;
+                    await vault.onChange(obsidianEvent, normalizedPath, null, stat);
                 }
             } else {
                 // Removed events don't need a stat object
                 await vault.onChange(eventType, normalizedPath, null, null);
             }
 
-            // 'raw' triggers Obsidian's cache refresh (MetadataCache re-read)
+            // 'raw' completes the pair Obsidian's own file watcher fires for external
+            // file changes. 'modified' above is the one that refreshes the vault tree
+            // and MetadataCache; 'raw' additionally surfaces the raw FS notification.
             if (eventType === 'file-changed' && isCurrent()) {
                 await vault.onChange('raw', normalizedPath, null, null);
             }

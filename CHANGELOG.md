@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- External edits to mounted folders now refresh Obsidian properly. `FileWatcher.dispatchEvent()` and the adapter write-path notification fed `vault.onChange('file-changed', …)`, but Obsidian's internal `Vault.onChange` only understands a fixed set of event names (`created`/`modified`/`removed`/`raw`, …); `'file-changed'` matched none, so the notification was silently dropped, MetadataCache never re-parsed the file (stale headings in TOC/Outline), and open editors kept a stale buffer that overwrote external changes on save. Both paths now emit `vault.onChange('modified', …)` (plus `'raw'`), matching what Obsidian's own file watcher produces for external modifications.
 - Drop watcher events received during suppression immediately, cancel pending change notifications when suppression starts, and prevent in-flight metadata reads or cache refreshes from escaping a suppression toggle. Applies to per-mount and global runtime suppression; new events resume normally after unmuting.
 - Added regression coverage for saved suppression changes taking effect without restart and surviving reload. Existing startup behavior is unchanged: saved suppression skips child-file replay, so mounted folders may appear empty. Native macOS confirmation for #16 remains pending.
 
