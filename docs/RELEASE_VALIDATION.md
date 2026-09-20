@@ -25,6 +25,14 @@ Obsidian typings are now 1.13.1. The manifest's minimum host version remains
 unchanged. The new destructive-button API is feature-detected; the existing
 settings display entry point remains available to older hosts.
 
+Post-rc.2 main also includes PR #47's mounted-file event translation. Regression
+tests exercise both the watcher and installed adapter callback against the
+checked-in `docs/vault-onchange.txt` handler, checking stat updates, content-cache
+invalidation, and public `modify`/`raw` events. That private-handler snapshot has
+no recorded host-version provenance; it is not a substitute for native testing.
+The published rc.2 assets do not contain this fix. Build the main revision under
+test and record its commit when running the external-edit check below.
+
 ## Native Release Gates
 
 Use a disposable vault and temporary source folders. Back up any files before
@@ -45,6 +53,7 @@ All native checks below remain pending. Existing CI runs on Ubuntu only.
 | Android / #18 | Install the packaged candidate on Android and enable it; configure a supported remote mount. Repeat after restarting the app. | No Node/Electron module-load failure; remote note opens; desktop-only local access is not required. |
 | Explorer / #39 | Add a mount using a native folder's context menu; hover mounted and ordinary rows; collapse and reopen folders; close/reopen the explorer and disable the plugin. | Mount uses a new child destination without shadowing native files; details show the active source; unrelated tooltips are unchanged; expansion persists; decorations and callbacks stop on unload. |
 | macOS watcher / #39 | Enable a local mount and create/edit a disposable source file externally. | Watcher starts without native fsevents binding errors and updates the mounted tree. |
+| External modifications / #47 (post-rc.2 main) | Open a copied mounted note in Obsidian; change its body, headings, and frontmatter using an external editor. Check the note, Outline, and metadata-dependent views without reopening, then edit and save in Obsidian. Repeat an in-app frontmatter write with native watcher delivery unavailable. | External changes refresh without toggling the plugin; Outline and metadata update; subsequent saves preserve the external edits. The adapter callback updates metadata even without native watcher delivery. Record results on current and oldest supported hosts; do not use valuable source files. |
 
 Unit tests also cover mounted binary append and rejection for unsupported remote
 mounts. Verify binary integrity against disposable files when testing a plugin

@@ -100,7 +100,7 @@ describe('FileWatcher', () => {
 
                 await getCallback('change')(`${mount.realPath}/note.md`);
                 await vi.runAllTimersAsync();
-                expect(mockOnChange.mock.calls.map(call => call[0])).toEqual(['file-changed', 'raw']);
+                expect(mockOnChange.mock.calls.map(call => call[0])).toEqual(['modified', 'raw']);
             } finally {
                 watcher.stopAll();
                 vi.useRealTimers();
@@ -162,7 +162,7 @@ describe('FileWatcher', () => {
                 watcher.startWatching(mount);
                 await getCallback('change')(`${mount.realPath}/note.md`);
                 await vi.runAllTimersAsync();
-                expect(mockOnChange.mock.calls.map(call => call[0])).toEqual(['file-changed']);
+                expect(mockOnChange.mock.calls.map(call => call[0])).toEqual(['modified']);
             } finally {
                 watcher.stopAll();
                 vi.useRealTimers();
@@ -463,7 +463,7 @@ describe('FileWatcher', () => {
             getPathCallback('change')('C:/Users/test/Documents/note.md');
             await vi.runAllTimersAsync();
 
-            expect(mockOnChange).toHaveBeenCalledWith('file-changed', 'mounts/docs/note.md', null, expect.any(Object));
+            expect(mockOnChange).toHaveBeenCalledWith('modified', 'mounts/docs/note.md', null, expect.any(Object));
             expect(mockOnChange).toHaveBeenCalledWith('raw', 'mounts/docs/note.md', null, null);
             vi.useRealTimers();
         });
@@ -495,9 +495,9 @@ describe('FileWatcher', () => {
             changeCb('C:/Users/test/Documents/note.md');
             await vi.runAllTimersAsync();
 
-            // Three rapid writes → one file-changed + one raw
+            // Three rapid writes → one modified + one raw
             expect(mockOnChange).toHaveBeenCalledTimes(2);
-            expect(mockOnChange).toHaveBeenCalledWith('file-changed', 'mounts/docs/note.md', null, expect.any(Object));
+            expect(mockOnChange).toHaveBeenCalledWith('modified', 'mounts/docs/note.md', null, expect.any(Object));
             vi.useRealTimers();
         });
 
@@ -518,7 +518,7 @@ describe('FileWatcher', () => {
             expect(mockOnChange).not.toHaveBeenCalled(); // still inside new window
 
             await vi.runAllTimersAsync(); // now past DEBOUNCE_MS
-            expect(mockOnChange).toHaveBeenCalledWith('file-changed', 'mounts/docs/note.md', null, expect.any(Object));
+            expect(mockOnChange).toHaveBeenCalledWith('modified', 'mounts/docs/note.md', null, expect.any(Object));
             vi.useRealTimers();
         });
 
@@ -535,7 +535,7 @@ describe('FileWatcher', () => {
             await vi.runAllTimersAsync();
 
             // Two different paths → two independent debounce timers → 4 onChange calls
-            expect(mockOnChange).toHaveBeenCalledTimes(4); // (file-changed + raw) × 2
+            expect(mockOnChange).toHaveBeenCalledTimes(4); // (modified + raw) × 2
             vi.useRealTimers();
         });
 
