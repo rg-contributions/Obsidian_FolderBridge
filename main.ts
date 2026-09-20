@@ -1663,7 +1663,7 @@ export default class FolderBridgePlugin extends Plugin {
 			// views after a frontmatter edit until the plugin is toggled or Obsidian is
 			// restarted.
 			//
-			// Firing 'file-changed' + 'raw' here is the same thing FileWatcher does for
+			// Firing 'modified' + 'raw' here is the same thing FileWatcher does for
 			// externally-detected changes, and mirrors the vault.create() patch above.
 			// If Chokidar also fires for the same write (on drives that DO support native
 			// events) the double notification is harmless — MetadataCache re-reads the
@@ -1678,7 +1678,9 @@ export default class FolderBridgePlugin extends Plugin {
 				try {
 					const stat = await this.app.vault.adapter.stat(normalizedPath);
 					if (stat) {
-						await vault.onChange('file-changed', normalizedPath, null, stat);
+						// 'modified' (not 'file-changed', which Vault.onChange ignores) so
+						// Obsidian invalidates the file content cache and re-parses metadata.
+						await vault.onChange('modified', normalizedPath, null, stat);
 						await vault.onChange('raw', normalizedPath, null, null);
 					}
 				} catch {

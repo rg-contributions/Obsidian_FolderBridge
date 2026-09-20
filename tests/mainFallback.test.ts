@@ -12,6 +12,8 @@ import { DEFAULT_SETTINGS, MountPoint } from '../src/types';
 import { serializeTocConfig } from '../src/TocConfig';
 import { checkPathAccessible } from '../src/OSHelpers';
 import { promises as fs } from 'fs';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 
 vi.mock('../main', () => import('../main' + '.ts'));
 
@@ -101,6 +103,67 @@ describe('main fallback regressions', () => {
         vi.restoreAllMocks();
     });
 
+    it.each(['watcher', 'adapter'] as const)('%s modifications invalidate cached content through the recorded vault handler', async source => {
+        const existing = mount('docs');
+        const { plugin, app, files } = await makePlugin([existing]);
+        const oldStat = { type: 'file' as const, size: 1, ctime: 1, mtime: 1 };
+        const newStat = { type: 'file' as const, size: 20, ctime: 1, mtime: 2 };
+        const file = Object.assign(new TFile(), { path: 'docs/note.md', stat: oldStat, cache: vi.fn() });
+        files.set(file.path, file);
+        const trigger = vi.fn();
+        const recordedHandler = runInNewContext(
+            `(${readFileSync(new URL('../docs/vault-onchange.txt', import.meta.url), 'utf8')})`,
+            { fM: TFile, mM: TFolder },
+        ) as (this: unknown, event: string, path: string, oldPath: string | null, stat: unknown) => void;
+        const vaultState = { fileMap: { [file.path]: file }, trigger, configDir: '.obsidian', getConfigFile: () => '' };
+        const onChange = vi.fn((event: string, path: string, oldPath: string | null, stat: unknown) => {
+            recordedHandler.call(vaultState, event, path, oldPath, stat);
+            return Promise.resolve();
+        });
+        Object.assign(app.vault, { onChange });
+
+        if (source === 'adapter') {
+            const installer = plugin as unknown as { installVirtualAdapter(): void };
+            installer.installVirtualAdapter();
+            vi.spyOn(app.vault.adapter, 'stat').mockResolvedValue(newStat);
+            const adapter = plugin.virtualAdapter as unknown as { onModify(path: string): Promise<void> };
+            await adapter.onModify(file.path);
+        } else {
+            vi.mocked(app.vault.adapter.stat).mockResolvedValue(newStat);
+            const watcher = new FileWatcher(app, plugin.pathMapper, () => false);
+            const dispatch = watcher as unknown as {
+                dispatchEvent(event: string, realPath: string, mount: MountPoint, isCurrent: () => boolean): Promise<void>;
+            };
+            await dispatch.dispatchEvent('file-changed', '/primary/note.md', existing, () => true);
+        }
+
+        expect(file.stat).toBe(newStat);
+        expect(file.cache).toHaveBeenCalledExactlyOnceWith(null);
+        expect(trigger.mock.calls).toEqual([['modify', file], ['raw', file.path]]);
+        expect(onChange.mock.calls.map(call => call[0])).toEqual(['modified', 'raw']);
+    });
+
+    it.each(['persisted-suppression', 'runtime-suppression', 'null-stat', 'failed-stat', 'unmounted', 'missing-handler'] as const)(
+        'keeps adapter modification notifications best-effort for %s', async scenario => {
+            const existing = { ...mount('docs'), watcherSuppressAllEvents: scenario === 'persisted-suppression' };
+            const { plugin, app } = await makePlugin([existing]);
+            const onChange = (app.vault as unknown as { onChange: ReturnType<typeof vi.fn> }).onChange;
+            const installer = plugin as unknown as { installVirtualAdapter(): void };
+            installer.installVirtualAdapter();
+            plugin.fileWatcher = new FileWatcher(app, plugin.pathMapper, () => false);
+            if (scenario === 'runtime-suppression') plugin.fileWatcher.setSuppressed(existing.id, true);
+            if (scenario === 'missing-handler') Object.assign(app.vault, { onChange: undefined });
+            const stat = vi.spyOn(app.vault.adapter, 'stat').mockResolvedValue(null);
+            if (scenario === 'failed-stat') stat.mockRejectedValue(new Error('metadata unavailable'));
+            const adapter = plugin.virtualAdapter as unknown as { onModify(path: string): Promise<void> };
+
+            await expect(adapter.onModify(scenario === 'unmounted' ? 'outside/note.md' : 'docs/note.md')).resolves.toBeUndefined();
+
+            expect(onChange).not.toHaveBeenCalled();
+            expect(stat).toHaveBeenCalledTimes(scenario === 'null-stat' || scenario === 'failed-stat' ? 1 : 0);
+        },
+    );
+
     it.each([false, true])('applies saved suppression changes immediately and retains them on reload (initial: %s)', async initial => {
         const existing = { ...mount('docs'), watcherSuppressAllEvents: initial };
         const { plugin, saveData } = await makePlugin([existing]);
@@ -151,7 +214,7 @@ describe('main fallback regressions', () => {
             highlightMountedInExplorer(): void;
         };
         for (const method of ['registerExplorerTooltipAugmentation', 'registerExplorerExpansionTracking', 'setupNativeTooltipObserver', 'highlightMountedInExplorer'] as const) {
-            vi.spyOn(explorer, method).mockImplementation(() => {});
+            vi.spyOn(explorer, method).mockImplementation(() => { });
         }
         Object.assign(app.workspace, {
             getLeavesOfType: () => [{ view: { containerEl: current } }],

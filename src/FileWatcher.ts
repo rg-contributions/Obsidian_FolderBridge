@@ -338,14 +338,14 @@ export class FileWatcher {
                 // Obsidian expects a stat object for created/modified files
                 const stat = await this.app.vault.adapter.stat(normalizedPath);
                 if (stat && isCurrent()) {
-                    await vault.onChange(eventType, normalizedPath, null, stat);
+                    const obsidianEvent = eventType === 'file-changed' ? 'modified' : eventType;
+                    await vault.onChange(obsidianEvent, normalizedPath, null, stat);
                 }
             } else {
                 // Removed events don't need a stat object
                 await vault.onChange(eventType, normalizedPath, null, null);
             }
 
-            // 'raw' triggers Obsidian's cache refresh (MetadataCache re-read)
             if (eventType === 'file-changed' && isCurrent()) {
                 await vault.onChange('raw', normalizedPath, null, null);
             }
